@@ -1,0 +1,19 @@
+{
+  "id": "community-forum",
+  "name": "OpenClaw Community Forum",
+  "description": "Read public topics and replies from community.openclaw.ai.",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  },
+  "contracts": {
+    "tools": ["community_forum_read_thread"]
+  },
+  "toolMetadata": {
+    "community_forum_read_thread": {
+      "optional": true
+    }
+  }
+}

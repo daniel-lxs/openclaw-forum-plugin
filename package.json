@@ -1,0 +1,30 @@
+{
+  "name": "@daniel-lxs/openclaw-plugin-community-forum",
+  "version": "0.1.0",
+  "description": "Read public OpenClaw Community forum topics from an OpenClaw agent.",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/daniel-lxs/openclaw-forum-plugin.git"
+  },
+  "files": ["src", "openclaw.plugin.json", "README.md"],
+  "engines": {
+    "node": ">=24.16.0 <25 || >=26.1.0"
+  },
+  "dependencies": {
+    "html-to-text": "10.0.1"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.11.6"
+  },
+  "openclaw": {
+    "extensions": ["./src/index.js"],
+    "compat": {
+      "pluginApi": ">=2026.11.6",
+      "minGatewayVersion": "2026.11.6"
+    },
+    "build": {
+      "openclawVersion": "2026.11.6"
+    }
+  }
+}
