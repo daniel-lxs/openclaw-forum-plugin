@@ -1,6 +1,6 @@
 {
   "name": "@daniel-lxs/openclaw-plugin-community-forum",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "List and read public OpenClaw Community forum topics from an OpenClaw agent.",
   "type": "module",
   "repository": {
