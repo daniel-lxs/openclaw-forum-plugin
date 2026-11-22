@@ -132,7 +132,10 @@ function fitForumResult(status, details, data, assertCompleteResult) {
     }
     return null;
   }
-  return { content: [{ type: "text", text }], details };
+  return {
+    content: [{ type: "text", text }],
+    details: { ...details, ...data },
+  };
 }
 
 function fitPage(details, title, posts, assertCompleteResult) {
@@ -311,12 +314,22 @@ export async function listTopics({ category, limit = 5 }, agentSignal, assertCom
   const topics = [...byId.values()]
     .sort((left, right) => Date.parse(right.created_at) - Date.parse(left.created_at) || right.id - left.id)
     .slice(0, limit)
-    .map((topic) => ({
-      title: topic.title,
-      url: `${forumOrigin}/t/${topic.id}`,
-      category: categories.get(topic.category_id)?.name ?? null,
-      createdAt: topic.created_at,
-    }));
+    .map((topic) => {
+      const postCount = positiveInteger(topic.posts_count) ? topic.posts_count : null;
+      // Discourse's reply_count can exclude replies that aren't linked to a specific post.
+      const replyCount = postCount === null ? null : postCount - 1;
+      const lastActivityAt = [topic.bumped_at, topic.last_posted_at]
+        .find((value) => typeof value === "string" && Number.isFinite(Date.parse(value))) ?? null;
+      return {
+        title: topic.title,
+        url: `${forumOrigin}/t/${topic.id}`,
+        category: categories.get(topic.category_id)?.name ?? null,
+        createdAt: topic.created_at,
+        lastActivityAt,
+        postCount,
+        replyCount,
+      };
+    });
   const details = { categoryId: selected?.id ?? null, requestedLimit: limit, returnedCount: topics.length };
   const result = fitForumResult(
     "Public forum topics, newest first. Use the returned links to read individual threads.",

@@ -22,6 +22,8 @@ Review and accept the plugin's capabilities when prompted. Run `openclaw config 
 
 ## What the agent can list and read
 
-Topic lists include titles, links, categories, and creation dates. They start with the most recently created topics and return five by default, with a maximum of 20.
+Topic lists include titles, links, categories, creation dates, last activity, and post and reply counts. The post count includes the original post. A reply count of zero means the topic has only its original post. An unavailable count or activity time is returned as `null`. Lists start with the most recently created topics and return five by default, with a maximum of 20.
 
 Thread reads include post text, authors, timestamps, reply relationships, and links. The agent can continue through long threads. Linked pages and media stay outside the read.
+
+Direct calls display the forum data as text. OpenClaw Code Mode calls return the same data as structured `topics` or `posts` arrays, with `nextCursor` for thread pagination.
