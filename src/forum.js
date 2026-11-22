@@ -5,6 +5,7 @@ const forumOrigin = "https://community.openclaw.ai";
 const batchSize = 20;
 const pagePostLimit = 40;
 const pageTextLimit = 15_000;
+const topicListLimit = 20;
 const responseByteLimit = 4 * 1024 * 1024;
 const toText = compile({
   wordwrap: false,
@@ -18,6 +19,11 @@ const toText = compile({
 
 function positiveInteger(value) {
   return Number.isSafeInteger(value) && value > 0;
+}
+
+function forumSignal(agentSignal) {
+  const timeout = AbortSignal.timeout(25_000);
+  return agentSignal ? AbortSignal.any([agentSignal, timeout]) : timeout;
 }
 
 function parseTopicLink(value) {
@@ -57,7 +63,7 @@ async function fetchJson(url, signal) {
   if (!response.ok || !response.body) {
     await response.body?.cancel();
     if ([401, 403, 404, 410].includes(response.status)) {
-      throw new Error("The topic or requested posts are unavailable to anonymous forum readers.");
+      throw new Error("The requested forum data is unavailable to anonymous readers.");
     }
     if (response.status === 429) {
       throw new Error("The OpenClaw Community Forum is rate limiting reads. Try again later.");
@@ -108,12 +114,8 @@ function pageStart(cursor, topicId, stream) {
   throw new Error("This cursor is invalid or the thread has changed. Read it again from the start.");
 }
 
-function fitPage(details, title, posts, assertCompleteResult) {
-  const status = details.nextCursor === null
-    ? "End of public thread. Answer in chat with non-destructive diagnostic steps and relevant post links. "
-      + "Use plain language for commands you cannot verify during this turn."
-    : "More of the public thread is available. Call again with nextCursor.";
-  const wrapped = wrapExternalContent(JSON.stringify({ title, posts }, null, 2), { source: "web_fetch" });
+function fitForumResult(status, details, data, assertCompleteResult) {
+  const wrapped = wrapExternalContent(JSON.stringify(data, null, 2), { source: "web_fetch" });
   const text = `${status}\n${JSON.stringify(details)}\n\n${wrapped}`;
   // OpenClaw weights some non-ASCII characters more heavily than their UTF-16 length.
   // Bound each non-ASCII code unit at 12 to leave room under the default 16,000 limit.
@@ -131,6 +133,14 @@ function fitPage(details, title, posts, assertCompleteResult) {
     return null;
   }
   return { content: [{ type: "text", text }], details };
+}
+
+function fitPage(details, title, posts, assertCompleteResult) {
+  const status = details.nextCursor === null
+    ? "End of public thread. Answer in chat with non-destructive diagnostic steps and relevant post links. "
+      + "Use plain language for commands you cannot verify during this turn."
+    : "More of the public thread is available. Call again with nextCursor.";
+  return fitForumResult(status, details, { title, posts }, assertCompleteResult);
 }
 
 function fitPostPrefix(body, offset, render) {
@@ -160,8 +170,7 @@ function fitPostPrefix(body, offset, render) {
 
 export async function readThread({ url, cursor }, agentSignal, assertCompleteResult) {
   const { topicId, requestedPost } = parseTopicLink(url);
-  const timeout = AbortSignal.timeout(25_000);
-  const signal = agentSignal ? AbortSignal.any([agentSignal, timeout]) : timeout;
+  const signal = forumSignal(agentSignal);
   const topic = await fetchJson(`${forumOrigin}/t/${topicId}.json`, signal);
   const stream = topic?.post_stream?.stream;
   if (topic?.id !== topicId || typeof topic.title !== "string" || !Array.isArray(stream)
@@ -231,4 +240,92 @@ export async function readThread({ url, cursor }, agentSignal, assertCompleteRes
   }
 
   return page;
+}
+
+export async function listTopics({ category, limit = 5 }, agentSignal, assertCompleteResult) {
+  if (!positiveInteger(limit) || limit > topicListLimit) {
+    throw new Error(`Choose a topic count from 1 to ${topicListLimit}.`);
+  }
+  if (category != null && (typeof category !== "string" || !category.trim() || category.length > 100)) {
+    throw new Error("Provide a public forum category name or slug.");
+  }
+
+  const signal = forumSignal(agentSignal);
+  const site = await fetchJson(`${forumOrigin}/site.json`, signal);
+  if (!Array.isArray(site?.categories)) {
+    throw new Error("The forum returned an invalid public category list.");
+  }
+  const categories = new Map(site.categories
+    .filter((item) => positiveInteger(item?.id) && typeof item.name === "string" && typeof item.slug === "string")
+    .map((item) => [item.id, item]));
+  let selected;
+  if (category != null) {
+    const name = category.trim().toLowerCase();
+    const matches = [...categories.values()]
+      .filter((item) => item.name.toLowerCase() === name || item.slug.toLowerCase() === name);
+    if (matches.length !== 1) {
+      throw new Error(matches.length
+        ? "That name matches multiple public forum categories. Use a category slug."
+        : "That public forum category was not found. Use its name or slug.");
+    }
+    [selected] = matches;
+  }
+
+  const path = selected ? `/c/${encodeURIComponent(selected.slug)}/${selected.id}.json` : "/latest.json";
+  const endpoint = new URL(path, forumOrigin);
+  endpoint.searchParams.set("order", "created");
+  endpoint.searchParams.set("ascending", "false");
+  endpoint.searchParams.set("per_page", String(limit));
+  endpoint.searchParams.set("no_definitions", "true");
+  if (selected) {
+    endpoint.searchParams.set("no_subcategories", "true");
+  }
+
+  const byId = new Map();
+  for (let page = 0; byId.size < limit; page += 1) {
+    endpoint.searchParams.set("page", String(page));
+    const { topic_list: list } = await fetchJson(endpoint, signal);
+    if (!Array.isArray(list?.topics)) {
+      throw new Error("The forum returned an invalid public topic list.");
+    }
+    const previousCount = byId.size;
+    for (const topic of list.topics) {
+      if (topic?.visible === false || topic?.archetype === "private_message"
+          || (selected && topic?.category_id !== selected.id)) {
+        continue;
+      }
+      if (!positiveInteger(topic?.id) || typeof topic.title !== "string" || typeof topic.created_at !== "string"
+          || !Number.isFinite(Date.parse(topic.created_at))) {
+        throw new Error("The forum returned an invalid public topic.");
+      }
+      byId.set(topic.id, topic);
+    }
+    if (!list.more_topics_url) {
+      break;
+    }
+    if (byId.size === previousCount) {
+      throw new Error("The public topic list did not advance.");
+    }
+  }
+
+  const topics = [...byId.values()]
+    .sort((left, right) => Date.parse(right.created_at) - Date.parse(left.created_at) || right.id - left.id)
+    .slice(0, limit)
+    .map((topic) => ({
+      title: topic.title,
+      url: `${forumOrigin}/t/${topic.id}`,
+      category: categories.get(topic.category_id)?.name ?? null,
+      createdAt: topic.created_at,
+    }));
+  const details = { categoryId: selected?.id ?? null, requestedLimit: limit, returnedCount: topics.length };
+  const result = fitForumResult(
+    "Public forum topics, newest first. Use the returned links to read individual threads.",
+    details,
+    { category: selected?.name ?? null, topics },
+    assertCompleteResult,
+  );
+  if (!result) {
+    throw new Error("This topic list cannot fit in the current tool result budget. Request fewer topics.");
+  }
+  return result;
 }
