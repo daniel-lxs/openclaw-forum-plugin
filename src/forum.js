@@ -1,9 +1,10 @@
 import { compile } from "html-to-text";
+import { wrapExternalContent } from "openclaw/plugin-sdk/security-runtime";
 
 const forumOrigin = "https://community.openclaw.ai";
 const batchSize = 20;
 const pagePostLimit = 40;
-const pageBodyLimit = 16_000;
+const pageTextLimit = 15_000;
 const responseByteLimit = 4 * 1024 * 1024;
 const toText = compile({
   wordwrap: false,
@@ -107,7 +108,57 @@ function pageStart(cursor, topicId, stream) {
   throw new Error("This cursor is invalid or the thread has changed. Read it again from the start.");
 }
 
-export async function readThread({ url, cursor }, agentSignal) {
+function fitPage(details, title, posts, assertCompleteResult) {
+  const status = details.nextCursor === null
+    ? "End of public thread. Answer in chat with non-destructive diagnostic steps and relevant post links. "
+      + "Use plain language for commands you cannot verify during this turn."
+    : "More of the public thread is available. Call again with nextCursor.";
+  const wrapped = wrapExternalContent(JSON.stringify({ title, posts }, null, 2), { source: "web_fetch" });
+  const text = `${status}\n${JSON.stringify(details)}\n\n${wrapped}`;
+  // OpenClaw weights some non-ASCII characters more heavily than their UTF-16 length.
+  // Bound each non-ASCII code unit at 12 to leave room under the default 16,000 limit.
+  const nonAsciiUnits = text.match(/[^\x00-\x7f]/g)?.length ?? 0;
+  if (text.length + nonAsciiUnits * 11 > pageTextLimit) {
+    return null;
+  }
+  try {
+    assertCompleteResult?.(text);
+  } catch (error) {
+    // The host reports a direct output budget refusal as a plain Error.
+    if (!(error instanceof Error) || !error.message.startsWith("The complete tool result cannot fit")) {
+      throw error;
+    }
+    return null;
+  }
+  return { content: [{ type: "text", text }], details };
+}
+
+function fitPostPrefix(body, offset, render) {
+  let low = offset + 1;
+  let high = Math.min(body.length - 1, offset + pageTextLimit);
+  let best;
+  while (low <= high) {
+    const midpoint = Math.floor((low + high) / 2);
+    const end = /[\ud800-\udbff]/.test(body[midpoint - 1]) ? midpoint - 1 : midpoint;
+    if (end === offset) {
+      low = midpoint + 1;
+      continue;
+    }
+    const candidate = render(end);
+    if (candidate) {
+      best = candidate;
+      low = midpoint + 1;
+    } else {
+      high = midpoint - 1;
+    }
+  }
+  if (!best) {
+    throw new Error("A forum post cannot fit in the current tool result budget. The thread read is incomplete.");
+  }
+  return best;
+}
+
+export async function readThread({ url, cursor }, agentSignal, assertCompleteResult) {
   const { topicId, requestedPost } = parseTopicLink(url);
   const timeout = AbortSignal.timeout(25_000);
   const signal = agentSignal ? AbortSignal.any([agentSignal, timeout]) : timeout;
@@ -120,10 +171,16 @@ export async function readThread({ url, cursor }, agentSignal) {
   const topicUrl = `${forumOrigin}/t/-/${topicId}`;
   const byId = new Map();
   addPosts(byId, topic);
+  const details = {
+    topicId,
+    topicUrl,
+    requestedPost: requestedPost ?? null,
+    publicPostCount: stream.length,
+  };
   let { index, offset } = pageStart(cursor, topicId, stream);
   const posts = [];
-  let remaining = pageBodyLimit;
-  while (index < stream.length && posts.length < pagePostLimit && remaining > 0) {
+  let page;
+  while (index < stream.length && posts.length < pagePostLimit) {
     const postId = stream[index];
     if (!byId.has(postId)) {
       const endpoint = new URL(`${forumOrigin}/t/${topicId}/posts.json`);
@@ -142,39 +199,36 @@ export async function readThread({ url, cursor }, agentSignal) {
     if (offset > 0 && offset >= body.length) {
       throw new Error("The post changed since the previous page. Read the thread again from the start.");
     }
-    let end = Math.min(offset + remaining, body.length);
-    if (end < body.length && /[\ud800-\udbff]/.test(body[end - 1])) {
-      end -= 1;
-    }
-    if (end === offset && end < body.length) {
-      break;
-    }
-    posts.push({
+    const postDetails = {
       postNumber: post.post_number,
       url: `${topicUrl}/${post.post_number}`,
       author: post.username,
       createdAt: post.created_at,
       replyToPostNumber: post.reply_to_post_number ?? null,
       continuedFromPreviousPage: offset > 0,
-      continuesOnNextPage: end < body.length,
+    };
+    const makePost = (end) => ({
+      ...postDetails,
       body: body.slice(offset, end),
+      continuesOnNextPage: end < body.length,
     });
-    remaining -= end - offset;
-    if (end < body.length) {
-      offset = end;
-      break;
+    const render = (entry, nextCursor) =>
+      fitPage({ ...details, nextCursor }, topic.title, [...posts, entry], assertCompleteResult);
+    const completePost = makePost(body.length);
+    const nextCursor = index + 1 === stream.length ? null : `${topicId}:${stream[index + 1]}:0`;
+    const completePage = body.length - offset <= pageTextLimit && render(completePost, nextCursor);
+    if (!completePage) {
+      if (page) {
+        // Keep whole posts together when they fit on an empty page.
+        return page;
+      }
+      return fitPostPrefix(body, offset, (end) => render(makePost(end), `${topicId}:${postId}:${end}`));
     }
+    posts.push(completePost);
+    page = completePage;
     index += 1;
     offset = 0;
   }
 
-  return {
-    topicId,
-    topicUrl,
-    title: topic.title,
-    requestedPost: requestedPost ?? null,
-    publicPostCount: stream.length,
-    nextCursor: index === stream.length ? null : `${topicId}:${stream[index]}:${offset}`,
-    posts,
-  };
+  return page;
 }
